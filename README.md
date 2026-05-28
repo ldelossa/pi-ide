@@ -6,6 +6,39 @@ selection) and routes `write`/`edit` tool calls through the editor as
 interactive diffs. The wireformat is compatible with Claude Code's editor
 integration.
 
+## Install
+
+```bash
+pi install git:github.com/ldelossa/pi-ide@v0.1.0
+```
+
+That writes to `~/.pi/agent/settings.json` and loads pi-ide on every pi
+session. To scope it to one project instead of globally, add `-l`:
+
+```bash
+pi install -l git:github.com/ldelossa/pi-ide@v0.1.0
+```
+
+Project installs land in `./.pi/settings.json` and can be checked in so
+teammates pick the extension up automatically.
+
+To try it without installing permanently:
+
+```bash
+pi -e git:github.com/ldelossa/pi-ide@v0.1.0
+```
+
+To remove:
+
+```bash
+pi remove git:github.com/ldelossa/pi-ide
+```
+
+You also need an editor that speaks the protocol. The reference Neovim
+implementation is at <https://github.com/ldelossa/pi-ide.nvim>.
+
+Once both are running, use `/ide` inside pi to connect to the editor.
+
 ## Architecture
 
 1. Editor starts a loopback MCP server on a free TCP port. Writes a lockfile to
