@@ -1,0 +1,39 @@
+{
+	"name": "pi-ide",
+	"version": "0.1.0",
+	"description": "Pi extension that connects to a running editor (Neovim today, more later) over a local WebSocket. Adds ambient editor context to the agent and routes write/edit tool calls through interactive diffs in the editor.",
+	"keywords": ["pi-package", "pi", "ide", "neovim"],
+	"license": "MIT",
+	"author": "Louis DeLosSantos <louis.delos@gmail.com>",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/ldelossa/pi-ide.git"
+	},
+	"homepage": "https://github.com/ldelossa/pi-ide#readme",
+	"bugs": "https://github.com/ldelossa/pi-ide/issues",
+	"type": "module",
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
+	"scripts": {
+		"check": "tsc --noEmit"
+	},
+	"dependencies": {
+		"ws": "8.21.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"@types/ws": "8.18.1",
+		"typescript": "5.9.3"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
