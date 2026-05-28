@@ -1,6 +1,6 @@
 {
-	"name": "pi-ide",
-	"version": "0.1.0",
+	"name": "@ldelossa/pi-ide",
+	"version": "0.1.1",
 	"description": "Pi extension that connects to a running editor (Neovim today, more later) over a local WebSocket. Adds ambient editor context to the agent and routes write/edit tool calls through interactive diffs in the editor.",
 	"keywords": ["pi-package", "pi", "ide", "neovim"],
 	"license": "MIT",

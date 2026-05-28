@@ -9,14 +9,14 @@ integration.
 ## Install
 
 ```bash
-pi install git:github.com/ldelossa/pi-ide@v0.1.0
+pi install npm:@ldelossa/pi-ide
 ```
 
 That writes to `~/.pi/agent/settings.json` and loads pi-ide on every pi
 session. To scope it to one project instead of globally, add `-l`:
 
 ```bash
-pi install -l git:github.com/ldelossa/pi-ide@v0.1.0
+pi install -l npm:@ldelossa/pi-ide
 ```
 
 Project installs land in `./.pi/settings.json` and can be checked in so
@@ -25,13 +25,19 @@ teammates pick the extension up automatically.
 To try it without installing permanently:
 
 ```bash
-pi -e git:github.com/ldelossa/pi-ide@v0.1.0
+pi -e npm:@ldelossa/pi-ide
 ```
 
 To remove:
 
 ```bash
-pi remove git:github.com/ldelossa/pi-ide
+pi remove npm:@ldelossa/pi-ide
+```
+
+Git installs also work if you prefer pinning to a tag:
+
+```bash
+pi install git:github.com/ldelossa/pi-ide@v0.1.0
 ```
 
 You also need an editor that speaks the protocol. The reference Neovim
