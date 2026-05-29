@@ -213,6 +213,9 @@ Model precedence: the CLI flag (`--pi-ide-suggestion-model <provider>/<id>`)
 wins. Otherwise the editor-provided `model` field is used. If neither is
 set, the current session's model is used.
 
+To find valid `provider/id` strings, run `pi --list-models` and join the
+`provider` and `model` columns with a `/` (e.g., `openai/gpt-4o`).
+
 ## Reference editor implementation
 
 Neovim: `pi-ide.nvim`. Implements both the editor-side contract (diffs,
