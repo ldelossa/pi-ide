@@ -36,6 +36,17 @@ let inFlightSuggestions = 0;
 let spinnerTimer: ReturnType<typeof setInterval> | null = null;
 let spinnerFrame = 0;
 
+function disconnectFromIde(): void {
+	if (!client) return;
+	const old = client;
+	client = null;
+	old.close();
+	resetState();
+	inFlightSuggestions = 0;
+	stopSpinner();
+	renderWidget();
+}
+
 function resetState(): void {
 	state = { filePath: null, cursorLine: null, selection: null };
 }
@@ -293,7 +304,11 @@ type PickResult =
 	| { kind: "none" }
 	| { kind: "cancelled" };
 
-async function pickLockfile(cwd: string, ui: { select: (t: string, o: string[]) => Promise<string | undefined> }): Promise<PickResult> {
+async function pickLockfile(
+	cwd: string,
+	ui: { select: (t: string, o: string[]) => Promise<string | undefined> },
+	current?: Lockfile,
+): Promise<PickResult> {
 	const all = await listLockfiles();
 	const candidates: Lockfile[] = [];
 	for (const lf of all) {
@@ -305,9 +320,11 @@ async function pickLockfile(cwd: string, ui: { select: (t: string, o: string[]) 
 	if (candidates.length === 0) return { kind: "none" };
 	const labels = candidates.map((c) => {
 		const folder = c.workspaceFolders[0] ?? "?";
-		return `${c.ideName} · ${folder} · pid=${c.pid} port=${c.port}`;
+		const marker = current && c.port === current.port && c.pid === current.pid ? " · (connected)" : "";
+		return `${c.ideName} · ${folder} · pid=${c.pid} port=${c.port}${marker}`;
 	});
-	const choice = await ui.select("Connect to IDE", labels);
+	const title = current ? "Select IDE (toggle to disconnect)" : "Connect to IDE";
+	const choice = await ui.select(title, labels);
 	if (!choice) return { kind: "cancelled" };
 	const lockfile = candidates[labels.indexOf(choice)];
 	return lockfile ? { kind: "selected", lockfile } : { kind: "cancelled" };
@@ -324,18 +341,36 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("ide", {
-		description: "Connect to a running IDE for ambient context and IDE-routed diffs.",
+		description: "Connect to a running IDE for ambient context and IDE-routed diffs. Select the current IDE to disconnect.",
 		async handler(_args, ctx) {
-			if (client?.isConnected()) {
-				ctx.ui.notify(`Already connected to ${client.lockfile.ideName} (port ${client.lockfile.port})`);
-				return;
+			const wasConnected = client?.isConnected() ?? false;
+			const currentLockfile = wasConnected ? client!.lockfile : undefined;
+			const pick = await pickLockfile(ctx.cwd, ctx.ui, currentLockfile);
+			if (pick.kind === "cancelled") return;
+
+			if (wasConnected) {
+				if (pick.kind === "none") {
+					disconnectFromIde();
+					ctx.ui.notify(`Disconnected from ${currentLockfile!.ideName}`, "warning");
+					return;
+				}
+				const same =
+					pick.lockfile.port === currentLockfile!.port &&
+					pick.lockfile.pid === currentLockfile!.pid;
+				if (same) {
+					disconnectFromIde();
+					ctx.ui.notify(`Disconnected from ${currentLockfile!.ideName}`, "warning");
+					return;
+				}
+				// Switch to a different IDE
+				disconnectFromIde();
 			}
-			const pick = await pickLockfile(ctx.cwd, ctx.ui);
+
 			if (pick.kind === "none") {
 				ctx.ui.notify("No running IDE found for this project", "warning");
 				return;
 			}
-			if (pick.kind === "cancelled") return;
+
 			const next = new IdeClient(pick.lockfile);
 			next.onNotification = onNotification;
 			next.onRequest("getSuggestions", async (params, signal) => {

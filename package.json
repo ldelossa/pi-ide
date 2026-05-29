@@ -7,8 +7,7 @@
 		"client.ts",
 		"index.ts",
 		"LICENSE",
-		"README.md",
-		"tsconfig.json"
+		"README.md"
 	],
 	"license": "MIT",
 	"author": "Louis DeLosSantos <louis.delos@gmail.com>",
@@ -29,11 +28,8 @@
 		"ws": "8.21.0"
 	},
 	"peerDependencies": {
-		"@earendil-works/pi-agent-core": "*",
 		"@earendil-works/pi-ai": "*",
-		"@earendil-works/pi-coding-agent": "*",
-		"@earendil-works/pi-tui": "*",
-		"typebox": "*"
+		"@earendil-works/pi-coding-agent": "*"
 	},
 	"devDependencies": {
 		"@types/node": "22.19.19",

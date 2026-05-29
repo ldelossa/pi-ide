@@ -216,6 +216,7 @@ set, the current session's model is used.
 ## Reference editor implementation
 
 Neovim: `pi-ide.nvim`. Implements both the editor-side contract (diffs,
-diagnostics, selection notifications) and the `getSuggestions` client,
-using treesitter for `outline` and an active LSP client as a hard
-requirement for the suggestion feature.
+diagnostics, selection notifications) and the `getSuggestions` client.
+Suggestions always work; treesitter and LSP enrich the context but are
+not required — the feature degrades gracefully to cursor-window-only
+context when either is unavailable.
