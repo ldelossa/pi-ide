@@ -1,10 +1,11 @@
 # pi-ide
 
 Connects a Pi coding-agent session to a running editor over a local
-WebSocket MCP server. Provides ambient editor context (current file, cursor,
-selection) and routes `write`/`edit` tool calls through the editor as
-interactive diffs. The wireformat is compatible with Claude Code's editor
-integration.
+WebSocket MCP server. Provides ambient editor context (current file,
+cursor, selection), routes `write`/`edit` tool calls through the editor
+as interactive diffs, and serves inline code completions (often called
+"suggestions") to editors that request them. The wireformat is compatible
+with Claude Code's editor integration.
 
 ## Install
 
@@ -166,6 +167,55 @@ enter, and text change. Debounce locally (~100ms recommended).
 Lines and characters are zero-based. The extension renders line numbers as
 1-based.
 
+## Editor-initiated requests
+
+The editor may send JSON-RPC requests to the extension over the same
+WebSocket. The extension processes them and returns responses.
+
+### Request: `getSuggestions`
+
+Returns inline code completions for the editor to render as ghost text or
+equivalent. The extension calls the configured model (current session
+model by default; see model precedence below), parses up to 3
+`<SUGGESTION>...</SUGGESTION>` blocks from the response, and returns them.
+
+Input:
+
+| field             | type   | description                                  |
+| ----------------- | ------ | -------------------------------------------- |
+| `filePath`        | string | optional. absolute path of the cursor file   |
+| `language`        | string | optional. filetype or language id            |
+| `outline`         | string | optional. structural sketch of the file      |
+| `enclosingScope`  | string | optional. surrounding function or class      |
+| `cursorBefore`    | string | text before cursor (typically ~20 lines)     |
+| `cursorAfter`     | string | text after cursor (typically ~10 lines)      |
+| `suggestionCount` | int    | optional. cap on returned alternatives. Max 3. |
+| `model`           | string | optional. preferred model "provider/id". CLI flag wins if set. |
+
+`outline` is whatever structural sketch the editor produces with its native
+source-analysis tool — treesitter sexpr (Neovim), document symbols from
+LSP (VS Code), PSI tree (JetBrains), or omitted entirely. The model accepts
+any text. Completion quality scales with the amount of structural context
+provided. The minimal viable payload is `cursorBefore` and `cursorAfter`.
+
+Response:
+
+```
+{ "suggestions": ["<text>", ...] }
+```
+
+Empty `suggestions` is valid and means the model declined to complete.
+
+Cancellation: editor sends `request_cancelled` notification with
+`{ "id": <request id> }`. The extension aborts the in-flight model call.
+
+Model precedence: the CLI flag (`--pi-ide-suggestion-model <provider>/<id>`)
+wins. Otherwise the editor-provided `model` field is used. If neither is
+set, the current session's model is used.
+
 ## Reference editor implementation
 
-Neovim: `pi-ide.nvim`.
+Neovim: `pi-ide.nvim`. Implements both the editor-side contract (diffs,
+diagnostics, selection notifications) and the `getSuggestions` client,
+using treesitter for `outline` and an active LSP client as a hard
+requirement for the suggestion feature.

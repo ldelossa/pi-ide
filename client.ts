@@ -84,14 +84,26 @@ export function matchesCwd(lockfile: Lockfile, cwd: string): boolean {
 }
 
 export type NotificationHandler = (method: string, params: unknown) => void;
+export type RequestHandler = (params: unknown, signal: AbortSignal) => Promise<unknown>;
 
 export class IdeClient {
 	private ws: WebSocket | null = null;
 	private closed = false;
 	public readonly lockfile: Lockfile;
 	private pending = new Map<string, Pending>();
+	private requestHandlers = new Map<string, RequestHandler>();
+	private inboundAborts = new Map<string, AbortController>();
+	// Ids that were cancelled before their handler started. Pruned on dispatch.
+	// Capped so a server that emits stray cancels can't grow this without bound;
+	// oldest entries are evicted first.
+	private earlyCancels = new Set<string>();
+	private static EARLY_CANCEL_CAP = 50;
 	public onNotification: NotificationHandler = () => {};
 	public onClose: () => void = () => {};
+
+	onRequest(method: string, handler: RequestHandler): void {
+		this.requestHandlers.set(method, handler);
+	}
 
 	constructor(lockfile: Lockfile) {
 		this.lockfile = lockfile;
@@ -158,23 +170,91 @@ export class IdeClient {
 	}
 
 	private handleMessage(text: string): void {
-		let msg: { id?: string; method?: string; params?: unknown; result?: unknown; error?: { code: number; message: string } };
+		let msg: {
+			id?: string | number;
+			method?: string;
+			params?: unknown;
+			result?: unknown;
+			error?: { code: number; message: string };
+		};
 		try {
 			msg = JSON.parse(text);
 		} catch {
 			return;
 		}
-		if (msg.id !== undefined) {
-			const pending = this.pending.get(msg.id);
+		// Response to a request we sent: has id and no method.
+		if (msg.id !== undefined && typeof msg.method !== "string") {
+			const pending = this.pending.get(String(msg.id));
 			if (!pending) return;
-			this.pending.delete(msg.id);
+			this.pending.delete(String(msg.id));
 			if (msg.error) pending.reject(new Error(`${msg.error.code}: ${msg.error.message}`));
 			else pending.resolve(msg.result);
 			return;
 		}
+		// Inbound request from server: has both id and method.
+		if (msg.id !== undefined && typeof msg.method === "string") {
+			void this.handleInboundRequest(msg.id, msg.method, msg.params);
+			return;
+		}
 		if (typeof msg.method === "string") {
+			if (msg.method === "request_cancelled") {
+				const params = msg.params as { id?: string | number } | undefined;
+				const id = params?.id;
+				if (id !== undefined) {
+					const key = String(id);
+					const ac = this.inboundAborts.get(key);
+					if (ac) {
+						ac.abort();
+					} else {
+						if (this.earlyCancels.size >= IdeClient.EARLY_CANCEL_CAP) {
+							const oldest = this.earlyCancels.values().next().value;
+							if (oldest !== undefined) this.earlyCancels.delete(oldest);
+						}
+						this.earlyCancels.add(key);
+					}
+				}
+				return;
+			}
 			this.onNotification(msg.method, msg.params);
 		}
+	}
+
+	private async handleInboundRequest(id: string | number, method: string, params: unknown): Promise<void> {
+		const key = String(id);
+		const handler = this.requestHandlers.get(method);
+		if (!handler) {
+			this.sendRaw({
+				jsonrpc: "2.0",
+				id,
+				error: { code: -32601, message: `Method not found: ${method}` },
+			});
+			return;
+		}
+		if (this.earlyCancels.delete(key)) {
+			this.sendRaw({
+				jsonrpc: "2.0",
+				id,
+				error: { code: -32800, message: "Request cancelled" },
+			});
+			return;
+		}
+		const ac = new AbortController();
+		this.inboundAborts.set(key, ac);
+		try {
+			const result = await handler(params, ac.signal);
+			this.sendRaw({ jsonrpc: "2.0", id, result });
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			const code = ac.signal.aborted ? -32800 : -32603;
+			this.sendRaw({ jsonrpc: "2.0", id, error: { code, message } });
+		} finally {
+			this.inboundAborts.delete(key);
+		}
+	}
+
+	private sendRaw(message: unknown): void {
+		if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+		this.ws.send(JSON.stringify(message));
 	}
 
 	private handleClose(): void {
@@ -183,6 +263,8 @@ export class IdeClient {
 		const err = new Error("IDE connection closed");
 		for (const pending of this.pending.values()) pending.reject(err);
 		this.pending.clear();
+		for (const ac of this.inboundAborts.values()) ac.abort();
+		this.inboundAborts.clear();
 		this.ws = null;
 		this.onClose();
 	}

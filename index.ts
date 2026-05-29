@@ -1,20 +1,59 @@
 import { readFile } from "node:fs/promises";
 import { basename, resolve as resolvePath } from "node:path";
-import { isToolCallEventType, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { completeSimple } from "@earendil-works/pi-ai";
+import {
+	isToolCallEventType,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
 import { IdeClient, isPidAlive, isPortListening, listLockfiles, type Lockfile, matchesCwd } from "./client.ts";
+
+const SUGGESTION_FLAG = "pi-ide-suggestion-model";
+const SUGGESTION_SYSTEM_PROMPT = `You are an inline code completion engine. Output up to N alternative completions for what should appear at the cursor position. Each must be wrapped in <SUGGESTION>...</SUGGESTION> tags. Order most-likely first.
+
+Rules:
+1. Output ONLY the code to insert. Do not repeat code before or after the cursor.
+2. Match the file's existing indentation, naming, and style.
+3. Stop at a natural unit boundary.
+4. If mid-token, complete that token first.
+5. If you have only one strong completion, output one block.
+6. If nothing reasonable, output zero blocks.`;
 
 type Selection = { startLine: number; endLine: number; text: string };
 type EditorState = { filePath: string | null; cursorLine: number | null; selection: Selection | null };
 
 const MAX_SELECTION_LINES = 100;
 const WIDGET_KEY = "pi-ide";
+const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_INTERVAL_MS = 80;
 
 let client: IdeClient | null = null;
 let state: EditorState = { filePath: null, cursorLine: null, selection: null };
 let ui: ExtensionUIContext | null = null;
+let sessionCtx: ExtensionContext | null = null;
+let inFlightSuggestions = 0;
+let spinnerTimer: ReturnType<typeof setInterval> | null = null;
+let spinnerFrame = 0;
 
 function resetState(): void {
 	state = { filePath: null, cursorLine: null, selection: null };
+}
+
+function startSpinner(): void {
+	if (spinnerTimer) return;
+	spinnerTimer = setInterval(() => {
+		spinnerFrame = (spinnerFrame + 1) % SPINNER.length;
+		renderWidget();
+	}, SPINNER_INTERVAL_MS);
+}
+
+function stopSpinner(): void {
+	if (spinnerTimer) {
+		clearInterval(spinnerTimer);
+		spinnerTimer = null;
+	}
+	spinnerFrame = 0;
 }
 
 function renderWidget(): void {
@@ -31,6 +70,9 @@ function renderWidget(): void {
 		body = `${ideName} · In ${basename(state.filePath)}`;
 	} else {
 		body = ideName;
+	}
+	if (inFlightSuggestions > 0) {
+		body += ` · Suggesting ${SPINNER[spinnerFrame]}`;
 	}
 	ui.setWidget(WIDGET_KEY, [body]);
 }
@@ -130,6 +172,122 @@ function applyEdits(original: string, edits: { oldText: string; newText: string 
 	return result;
 }
 
+type SuggestionParams = {
+	filePath?: string;
+	language?: string;
+	outline?: string;
+	enclosingScope?: string;
+	cursorBefore?: string;
+	cursorAfter?: string;
+	suggestionCount?: number;
+	// Editor-provided model preference, format "provider/id". The CLI flag
+	// (--pi-ide-suggestion-model) wins when both are set.
+	model?: string;
+};
+
+function buildSuggestionPrompt(params: SuggestionParams): string {
+	const filePath = params.filePath ?? "<unknown>";
+	const language = params.language ?? "<unknown>";
+	const outline = params.outline?.trim() ? params.outline : "(none)";
+	const enclosing = params.enclosingScope?.trim() ? params.enclosingScope : "(none)";
+	const before = params.cursorBefore ?? "";
+	const after = params.cursorAfter ?? "";
+	const count = params.suggestionCount ?? 3;
+	return `File: ${filePath}
+Language: ${language}
+
+<file_outline>
+${outline}
+</file_outline>
+
+<enclosing_scope>
+${enclosing}
+</enclosing_scope>
+
+<cursor_context>
+${before}<CURSOR>${after}
+</cursor_context>
+
+Provide up to ${count} suggestions.`;
+}
+
+function parseSuggestionBlocks(text: string): string[] {
+	const out: string[] = [];
+	const re = /<SUGGESTION>([\s\S]*?)<\/SUGGESTION>/g;
+	let m: RegExpExecArray | null;
+	while ((m = re.exec(text)) !== null) {
+		out.push(m[1]);
+	}
+	if (out.length === 0) {
+		// Salvage an unclosed trailing <SUGGESTION> when the LLM hit maxTokens
+		// before emitting the closing tag.
+		const open = text.lastIndexOf("<SUGGESTION>");
+		if (open !== -1 && text.indexOf("</SUGGESTION>", open) === -1) {
+			const tail = text.slice(open + "<SUGGESTION>".length).trimEnd();
+			if (tail) out.push(tail);
+		}
+	}
+	return out;
+}
+
+function resolveSuggestionModel(pi: ExtensionAPI, ctx: ExtensionContext, editorPref: string | undefined) {
+	// Precedence: CLI flag (operator override) > editor-provided preference >
+	// current session model.
+	const flagValue = pi.getFlag(SUGGESTION_FLAG);
+	const pick = (typeof flagValue === "string" && flagValue) ? flagValue : (editorPref || "");
+	if (pick) {
+		const slash = pick.indexOf("/");
+		if (slash === -1) {
+			throw new Error(`suggestion model expects provider/id, got "${pick}"`);
+		}
+		const provider = pick.slice(0, slash);
+		const id = pick.slice(slash + 1);
+		const m = ctx.modelRegistry.find(provider, id);
+		if (!m) throw new Error(`model not found: ${pick}`);
+		return m;
+	}
+	if (!ctx.model) throw new Error("no current model, no editor-provided model, and --pi-ide-suggestion-model not set");
+	return ctx.model;
+}
+
+async function generateSuggestions(pi: ExtensionAPI, params: SuggestionParams, signal: AbortSignal): Promise<string[]> {
+	if (!sessionCtx) throw new Error("session not yet started");
+	const ctx = sessionCtx;
+	const model = resolveSuggestionModel(pi, ctx, params.model);
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+	if (!auth.ok) throw new Error(`auth failed: ${auth.error}`);
+	if (!auth.apiKey) throw new Error(`no API key for ${model.provider}`);
+
+	const userText = buildSuggestionPrompt(params);
+	const response = await completeSimple(
+		model,
+		{
+			systemPrompt: SUGGESTION_SYSTEM_PROMPT,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: userText }],
+					timestamp: Date.now(),
+				},
+			],
+		},
+		{
+			apiKey: auth.apiKey,
+			headers: auth.headers,
+			maxTokens: 1024,
+			signal,
+			cacheRetention: "short",
+		},
+	);
+	const text = response.content
+		.filter((c): c is { type: "text"; text: string } => c.type === "text")
+		.map((c) => c.text)
+		.join("");
+	const blocks = parseSuggestionBlocks(text);
+	const max = params.suggestionCount ?? 3;
+	return blocks.slice(0, max);
+}
+
 type PickResult =
 	| { kind: "selected"; lockfile: Lockfile }
 	| { kind: "none" }
@@ -156,6 +314,15 @@ async function pickLockfile(cwd: string, ui: { select: (t: string, o: string[]) 
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag(SUGGESTION_FLAG, {
+		type: "string",
+		description: "Model to use for inline suggestions (format: provider/id). Falls back to current session model.",
+	});
+
+	pi.on("session_start", (_event, ctx) => {
+		sessionCtx = ctx;
+	});
+
 	pi.registerCommand("ide", {
 		description: "Connect to a running IDE for ambient context and IDE-routed diffs.",
 		async handler(_args, ctx) {
@@ -171,10 +338,25 @@ export default function (pi: ExtensionAPI) {
 			if (pick.kind === "cancelled") return;
 			const next = new IdeClient(pick.lockfile);
 			next.onNotification = onNotification;
+			next.onRequest("getSuggestions", async (params, signal) => {
+				inFlightSuggestions++;
+				if (inFlightSuggestions === 1) startSpinner();
+				renderWidget();
+				try {
+					const suggestions = await generateSuggestions(pi, (params ?? {}) as SuggestionParams, signal);
+					return { suggestions };
+				} finally {
+					inFlightSuggestions--;
+					if (inFlightSuggestions === 0) stopSpinner();
+					renderWidget();
+				}
+			});
 			next.onClose = () => {
 				if (client === next) {
 					client = null;
 					resetState();
+					inFlightSuggestions = 0;
+					stopSpinner();
 					renderWidget();
 					ctx.ui.notify("IDE disconnected", "warning");
 				}
@@ -267,6 +449,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => {
 		client?.close();
+		inFlightSuggestions = 0;
+		stopSpinner();
 		renderWidget();
 		client = null;
 		resetState();
