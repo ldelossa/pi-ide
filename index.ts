@@ -532,14 +532,25 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("before_agent_start", async (event) => {
+	pi.on("context", async (event) => {
 		const blocks: string[] = [];
 		const editor = renderEditorBlock();
 		if (editor) blocks.push(editor);
 		const diagnostics = await fetchDiagnosticsBlock();
 		if (diagnostics) blocks.push(diagnostics);
 		if (blocks.length === 0) return;
-		return { systemPrompt: `${event.systemPrompt}\n\n${blocks.join("\n\n")}` };
+		return {
+			messages: [
+				...event.messages,
+				{
+					role: "custom",
+					customType: "pi-ide.editor-context",
+					content: blocks.join("\n\n"),
+					display: false,
+					timestamp: Date.now(),
+				},
+			],
+		};
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
