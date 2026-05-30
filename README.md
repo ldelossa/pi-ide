@@ -216,6 +216,35 @@ set, the current session's model is used.
 To find valid `provider/id` strings, run `pi --list-models` and join the
 `provider` and `model` columns with a `/` (e.g., `openai/gpt-4o`).
 
+For suggestions, prefer low-latency models. Large reasoning models often
+feel too slow for inline completion; smaller coding-capable models such as
+`openai-codex/gpt-5.4-mini` or `deepseek/deepseek-v4-flash` usually provide
+a better interactive experience.
+
+### Request: `listSuggestionModels`
+
+Returns models available to the current pi session for runtime suggestion
+model selection in editors. The extension is the source of truth for model
+discovery; editors should not read pi config files directly.
+
+Input: none.
+
+Response:
+
+```
+{
+  "cliOverride": "<provider/id>",       // optional. --pi-ide-suggestion-model is active
+  "currentModel": "<provider/id>",      // optional. current pi session model
+  "models": [
+    { "provider": "openai", "id": "gpt-4o", "name": "GPT-4o", "model": "openai/gpt-4o" }
+  ]
+}
+```
+
+If `cliOverride` is present, editor-provided model selections are still
+accepted by the editor but will not affect suggestions because the CLI flag
+has higher precedence.
+
 ## Reference editor implementation
 
 Neovim: `pi-ide.nvim`. Implements both the editor-side contract (diffs,
