@@ -414,14 +414,7 @@ async function pickLockfile(
 	ui: { select: (t: string, o: string[]) => Promise<string | undefined> },
 	current?: Lockfile,
 ): Promise<PickResult> {
-	const all = await listLockfiles();
-	const candidates: Lockfile[] = [];
-	for (const lf of all) {
-		if (!matchesCwd(lf, cwd)) continue;
-		if (!isPidAlive(lf.pid)) continue;
-		if (!(await isPortListening(lf.port))) continue;
-		candidates.push(lf);
-	}
+	const candidates = await findCandidateLockfiles(cwd);
 	if (candidates.length === 0) return { kind: "none" };
 	const labels = candidates.map((c) => {
 		const folder = c.workspaceFolders[0] ?? "?";
@@ -435,6 +428,92 @@ async function pickLockfile(
 	return lockfile ? { kind: "selected", lockfile } : { kind: "cancelled" };
 }
 
+/**
+ * Find lockfiles that match the given cwd, have a live PID, and are listening.
+ */
+async function findCandidateLockfiles(cwd: string): Promise<Lockfile[]> {
+	const all = await listLockfiles();
+	const candidates: Lockfile[] = [];
+	for (const lf of all) {
+		if (!matchesCwd(lf, cwd)) continue;
+		if (!isPidAlive(lf.pid)) continue;
+		if (!(await isPortListening(lf.port))) continue;
+		candidates.push(lf);
+	}
+	return candidates;
+}
+
+/**
+ * Create an IdeClient, wire up handlers, and connect.
+ */
+async function connectToLockfile(lockfile: Lockfile, ctx: ExtensionContext, pi: ExtensionAPI): Promise<IdeClient | null> {
+	const next = new IdeClient(lockfile);
+	next.onNotification = onNotification;
+	next.onRequest("getSuggestions", async (params, signal) => {
+		inFlightSuggestions++;
+		if (inFlightSuggestions === 1) startSpinner();
+		renderWidget();
+		try {
+			const suggestions = await generateSuggestions(pi, (params ?? {}) as SuggestionParams, signal);
+			return { suggestions };
+		} finally {
+			inFlightSuggestions--;
+			if (inFlightSuggestions === 0) stopSpinner();
+			renderWidget();
+		}
+	});
+	next.onRequest("listSuggestionModels", async () => {
+		if (!sessionCtx) throw new Error("session not yet started");
+		const flagValue = pi.getFlag(SUGGESTION_FLAG);
+		const cliOverride = (typeof flagValue === "string" && flagValue) ? flagValue : undefined;
+		return {
+			cliOverride,
+			currentModel: sessionCtx.model ? `${sessionCtx.model.provider}/${sessionCtx.model.id}` : undefined,
+			models: sessionCtx.modelRegistry.getAvailable().map((model) => ({
+				provider: model.provider,
+				id: model.id,
+				name: model.name,
+				model: `${model.provider}/${model.id}`,
+			})),
+		};
+	});
+	next.onClose = () => {
+		if (client === next) {
+			client = null;
+			resetState();
+			inFlightSuggestions = 0;
+			stopSpinner();
+			renderWidget();
+			ui?.notify("IDE disconnected", "warning");
+		}
+	};
+	try {
+		await next.connect();
+	} catch (err) {
+		ui?.notify(`Failed to connect: ${err instanceof Error ? err.message : String(err)}`, "error");
+		return null;
+	}
+	client = next;
+	ui = ctx.ui;
+	renderWidget();
+	return next;
+}
+
+/**
+ * Auto-connect to the single matching IDE for this cwd, if exactly one valid
+ * lockfile exists. Does nothing when zero or multiple candidates are found.
+ */
+async function autoConnect(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+	if (client?.isConnected()) return;
+	const candidates = await findCandidateLockfiles(ctx.cwd);
+	if (candidates.length !== 1) return;
+	const lockfile = candidates[0];
+	const connected = await connectToLockfile(lockfile, ctx, pi);
+	if (connected) {
+		ui?.notify(`Auto-connected to ${lockfile.ideName}`, "info");
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerFlag(SUGGESTION_FLAG, {
 		type: "string",
@@ -445,8 +524,11 @@ export default function (pi: ExtensionAPI) {
 		description: "Path to append raw inline suggestion debug logs.",
 	});
 
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		sessionCtx = ctx;
+		if (event.reason === "new" || event.reason === "resume" || event.reason === "reload") {
+			await autoConnect(ctx, pi);
+		}
 	});
 
 	pi.registerCommand("ide", {
@@ -480,55 +562,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const next = new IdeClient(pick.lockfile);
-			next.onNotification = onNotification;
-			next.onRequest("getSuggestions", async (params, signal) => {
-				inFlightSuggestions++;
-				if (inFlightSuggestions === 1) startSpinner();
-				renderWidget();
-				try {
-					const suggestions = await generateSuggestions(pi, (params ?? {}) as SuggestionParams, signal);
-					return { suggestions };
-				} finally {
-					inFlightSuggestions--;
-					if (inFlightSuggestions === 0) stopSpinner();
-					renderWidget();
-				}
-			});
-			next.onRequest("listSuggestionModels", async () => {
-				if (!sessionCtx) throw new Error("session not yet started");
-				const flagValue = pi.getFlag(SUGGESTION_FLAG);
-				const cliOverride = (typeof flagValue === "string" && flagValue) ? flagValue : undefined;
-				return {
-					cliOverride,
-					currentModel: sessionCtx.model ? `${sessionCtx.model.provider}/${sessionCtx.model.id}` : undefined,
-					models: sessionCtx.modelRegistry.getAvailable().map((model) => ({
-						provider: model.provider,
-						id: model.id,
-						name: model.name,
-						model: `${model.provider}/${model.id}`,
-					})),
-				};
-			});
-			next.onClose = () => {
-				if (client === next) {
-					client = null;
-					resetState();
-					inFlightSuggestions = 0;
-					stopSpinner();
-					renderWidget();
-					ctx.ui.notify("IDE disconnected", "warning");
-				}
-			};
-			try {
-				await next.connect();
-			} catch (err) {
-				ctx.ui.notify(`Failed to connect: ${err instanceof Error ? err.message : String(err)}`, "error");
-				return;
-			}
-			client = next;
-			ui = ctx.ui;
-			renderWidget();
+			await connectToLockfile(pick.lockfile, ctx, pi);
 		},
 	});
 
