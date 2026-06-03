@@ -50,9 +50,11 @@ Once both are running, use `/ide` inside pi to connect to the editor.
 
 1. Editor starts a loopback MCP server on a free TCP port. Writes a lockfile to
    `$PI_IDE_LOCK_DIR` (default `~/.pi/ide/<port>.lock`). Removes it on exit.
-2. User runs `/ide` in pi. Extension enumerates lockfiles, filters to entries
-   whose `workspaceFolders` cover `cwd`, whose `pid` is alive, and whose port
-   accepts connections. Prompts on multiple matches.
+2. On startup, if `pi-ide.autoconnect` is not `false` and exactly one valid
+   lockfile matches `cwd`, the extension connects automatically. A sticky
+   reconnect target is remembered across `/new` sessions, keeping the same
+   IDE when multiple editors are open. Use `/ide` to manually connect,
+   switch IDEs, or disconnect.
 3. Extension opens `ws://127.0.0.1:<port>/` with header
    `x-pi-ide-authorization: <authToken>` and runs MCP `initialize`.
 4. While connected:
@@ -65,6 +67,45 @@ Once both are running, use `/ide` inside pi to connect to the editor.
      (reject). On reject, the tool call is blocked and the rejection is
      surfaced to the agent.
 5. Session shutdown closes the socket.
+
+## Autoconnect
+
+Autoconnect saves a manual `/ide` step by connecting to the IDE automatically.
+It is enabled by default.
+
+Connections are made on two occasions:
+
+**On start**
+1. `pi-ide.autoconnect` is not `false`
+2. Exactly one valid IDE lockfile exists for the current working directory
+
+**On session replacement** (`/new`, `/resume`, `/reload`)
+If the previous session was connected to an IDE, pi-ide tries to reconnect
+to that same IDE. This sticky reconnect bypasses the single-candidate rule,
+which means it can reconnect even when a second IDE has since started in the
+same directory. If the sticky IDE is no longer valid (closed, stopped,
+connection fails, or its project changed), autoconnect falls back to the
+cold-start rule.
+
+### Disabling
+
+Add to any Pi settings file:
+
+```json
+{
+  "pi-ide": {
+    "autoconnect": false
+  }
+}
+```
+
+| Scope | File |
+|-------|------|
+| Global | `~/.pi/agent/settings.json` |
+| Project | `.pi/settings.json` |
+
+Project settings override global settings. A missing setting is treated as
+enabled.
 
 ## Lockfile
 

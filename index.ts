@@ -3,6 +3,7 @@ import { basename, resolve as resolvePath } from "node:path";
 import { completeSimple } from "@earendil-works/pi-ai";
 import {
 	isToolCallEventType,
+	SettingsManager,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type ExtensionUIContext,
@@ -31,6 +32,60 @@ const WIDGET_KEY = "pi-ide";
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 80;
 
+// --- Autoconnect config & state ---
+const PI_IDE_SETTINGS_KEY = "pi-ide";
+const STICKY_STATE_KEY = Symbol.for("@ldelossa/pi-ide:sticky-state");
+
+type PiIdeSettings = {
+	autoconnect?: boolean;
+};
+
+type StickyState = {
+	lockfile?: Lockfile;
+};
+
+// --- Settings helpers ---
+
+function extractPiIdeSettings(settings: Record<string, unknown>): PiIdeSettings {
+	const raw = settings[PI_IDE_SETTINGS_KEY];
+	if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+	const obj = raw as Record<string, unknown>;
+	return {
+		autoconnect: typeof obj.autoconnect === "boolean" ? obj.autoconnect : undefined,
+	};
+}
+
+function isAutoconnectEnabled(cwd: string): boolean {
+	const manager = SettingsManager.create(cwd);
+	const globalSettings = extractPiIdeSettings(manager.getGlobalSettings() as Record<string, unknown>);
+	const projectSettings = extractPiIdeSettings(manager.getProjectSettings() as Record<string, unknown>);
+	return projectSettings.autoconnect ?? globalSettings.autoconnect ?? true;
+}
+
+// --- Sticky state helpers ---
+
+function getStickyState(): StickyState {
+	const g = globalThis as typeof globalThis & Record<symbol, StickyState | undefined>;
+	g[STICKY_STATE_KEY] ??= {};
+	return g[STICKY_STATE_KEY]!;
+}
+
+function setStickyLockfile(lockfile: Lockfile): void {
+	getStickyState().lockfile = lockfile;
+}
+
+function clearStickyLockfile(): void {
+	delete getStickyState().lockfile;
+}
+
+function getStickyLockfile(): Lockfile | undefined {
+	return getStickyState().lockfile;
+}
+
+function sameLockfile(a: Lockfile, b: Lockfile): boolean {
+	return a.port === b.port && a.pid === b.pid && a.authToken === b.authToken;
+}
+
 let client: IdeClient | null = null;
 let state: EditorState = { filePath: null, cursorLine: null, selection: null };
 let ui: ExtensionUIContext | null = null;
@@ -41,6 +96,7 @@ let spinnerFrame = 0;
 
 function disconnectFromIde(): void {
 	if (!client) return;
+	clearStickyLockfile();
 	const old = client;
 	client = null;
 	old.close();
@@ -448,6 +504,7 @@ async function findCandidateLockfiles(cwd: string): Promise<Lockfile[]> {
  */
 async function connectToLockfile(lockfile: Lockfile, ctx: ExtensionContext, pi: ExtensionAPI): Promise<IdeClient | null> {
 	const next = new IdeClient(lockfile);
+	ui = ctx.ui;
 	next.onNotification = onNotification;
 	next.onRequest("getSuggestions", async (params, signal) => {
 		inFlightSuggestions++;
@@ -490,27 +547,57 @@ async function connectToLockfile(lockfile: Lockfile, ctx: ExtensionContext, pi: 
 	try {
 		await next.connect();
 	} catch (err) {
-		ui?.notify(`Failed to connect: ${err instanceof Error ? err.message : String(err)}`, "error");
+		ctx.ui.notify(`Failed to connect: ${err instanceof Error ? err.message : String(err)}`, "error");
 		return null;
 	}
 	client = next;
-	ui = ctx.ui;
+	setStickyLockfile(lockfile);
 	renderWidget();
 	return next;
 }
 
 /**
- * Auto-connect to the single matching IDE for this cwd, if exactly one valid
- * lockfile exists. Does nothing when zero or multiple candidates are found.
+ * Auto-connect to an IDE.
+ *
+ * When `preferSticky` is true (session replacement flow), tries the sticky
+ * IDE from the previous session first, bypassing the single-candidate rule.
+ * Falls back to the cold-start rule when sticky is absent or stale.
+ *
+ * When `preferSticky` is false (cold startup), connects only when exactly one
+ * valid IDE candidate exists for the cwd.
  */
-async function autoConnect(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+async function autoConnect(ctx: ExtensionContext, pi: ExtensionAPI, options: { preferSticky: boolean }): Promise<void> {
 	if (client?.isConnected()) return;
-	const candidates = await findCandidateLockfiles(ctx.cwd);
+	if (!isAutoconnectEnabled(ctx.cwd)) return;
+
+	let candidates = await findCandidateLockfiles(ctx.cwd);
+
+	if (options.preferSticky) {
+		const sticky = getStickyLockfile();
+		if (sticky) {
+			const candidate = candidates.find((c) => sameLockfile(c, sticky));
+			if (candidate) {
+				const connected = await connectToLockfile(candidate, ctx, pi);
+				if (connected) {
+					ctx.ui.notify(`Reconnected to ${candidate.ideName}`, "info");
+					return;
+				}
+				// Treat a failed sticky reconnect as stale. Do not retry the
+				// same lockfile in the cold-start fallback below.
+				clearStickyLockfile();
+				candidates = candidates.filter((c) => !sameLockfile(c, candidate));
+			} else {
+				// Sticky IDE is gone; clear it and fall through to cold start logic.
+				clearStickyLockfile();
+			}
+		}
+	}
+
 	if (candidates.length !== 1) return;
 	const lockfile = candidates[0];
 	const connected = await connectToLockfile(lockfile, ctx, pi);
 	if (connected) {
-		ui?.notify(`Auto-connected to ${lockfile.ideName}`, "info");
+		ctx.ui.notify(`Auto-connected to ${lockfile.ideName}`, "info");
 	}
 }
 
@@ -526,8 +613,11 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		sessionCtx = ctx;
+		if (event.reason === "startup") {
+			await autoConnect(ctx, pi, { preferSticky: false });
+		}
 		if (event.reason === "new" || event.reason === "resume" || event.reason === "reload") {
-			await autoConnect(ctx, pi);
+			await autoConnect(ctx, pi, { preferSticky: true });
 		}
 	});
 
