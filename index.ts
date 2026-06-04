@@ -377,7 +377,11 @@ function alignSuggestion(block: string, params: SuggestionParams): string | null
 	const prefix = currentLinePrefix(params);
 	let suggestion = block.replace(/\r\n/g, "\n").replace(/^\n+/, "").replace(/\n+$/, "");
 	if (suggestion === "") return null;
-	if (prefix.trim() !== "" && suggestion.startsWith(prefix)) suggestion = suggestion.slice(prefix.length);
+	// The editor inserts the returned text at the cursor. When the cursor is
+	// already after indentation on an otherwise-empty line, a full-line model
+	// response often repeats that indentation; strip only that first-line prefix
+	// so the editor's existing indent is not doubled.
+	if (prefix !== "" && suggestion.startsWith(prefix)) suggestion = suggestion.slice(prefix.length);
 	if (params.cursorInComment) return normalizeCommentSuggestion(suggestion, prefix);
 	if (prefix.trim() !== "") {
 		const firstLine = suggestion.split("\n", 1)[0] ?? "";
