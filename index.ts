@@ -9,20 +9,16 @@ import {
 	type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { IdeClient, isPidAlive, isPortListening, listLockfiles, type Lockfile, matchesCwd } from "./client.ts";
+import {
+	SUGGESTION_SYSTEM_PROMPT,
+	buildSuggestionPrompt,
+	parseSuggestionBlocks,
+	prepareSuggestionCandidates,
+	type SuggestionParams,
+} from "./suggestion.ts";
 
 const SUGGESTION_FLAG = "pi-ide-suggestion-model";
 const SUGGESTION_DEBUG_LOG_FLAG = "pi-ide-suggestion-debug-log";
-const SUGGESTION_SYSTEM_PROMPT = `You are an inline code completion engine. Output up to N alternative completions for what should appear at the cursor position. Each must be wrapped in <SUGGESTION>...</SUGGESTION> tags. Order most-likely first.
-
-Rules:
-1. Output ONLY the code to insert. Do not repeat code before or after the cursor.
-2. Match the file's existing indentation, naming, and style.
-3. When the cursor is inside a comment, continue the current comment line from <CURSOR>. Do not start a new comment line or repeat the comment marker.
-4. When the cursor is on an empty line immediately following a descriptive comment, provide a multi-line implementation that fulfills the comment's intent.
-5. When the cursor follows existing code on the line, complete only the current statement. Do not add new statements, blocks, or functions.
-6. If mid-token, complete that token first.
-7. If you have only one strong completion, output one block.
-8. If nothing reasonable, output zero blocks.`;
 
 type Selection = { startLine: number; endLine: number; text: string };
 type EditorState = { filePath: string | null; cursorLine: number | null; selection: Selection | null };
@@ -242,93 +238,15 @@ function applyEdits(original: string, edits: { oldText: string; newText: string 
 	return result;
 }
 
-type SuggestionParams = {
-	filePath?: string;
-	language?: string;
-	outline?: string;
-	enclosingScope?: string;
-	cursorBefore?: string;
-	cursorAfter?: string;
-	suggestionCount?: number;
-	cursorInComment?: boolean;
-	// Editor-provided model preference, format "provider/id". The CLI flag
-	// (--pi-ide-suggestion-model) wins when both are set.
-	model?: string;
-};
-
-function lastLines(text: string, count: number): string {
-	const lines = text.split("\n");
-	return lines.slice(Math.max(0, lines.length - count)).join("\n");
-}
-
-function firstLines(text: string, count: number): string {
-	return text.split("\n").slice(0, count).join("\n");
-}
-
-function buildSuggestionPrompt(params: SuggestionParams): string {
-	const filePath = params.filePath ?? "<unknown>";
-	const language = params.language ?? "<unknown>";
-	const before = params.cursorBefore ?? "";
-	const after = params.cursorAfter ?? "";
-	const count = params.suggestionCount ?? 3;
-	if (params.cursorInComment) {
-		return `File: ${filePath}
-Language: ${language}
-
-The cursor is inside a comment. Continue only the current comment line from <CURSOR>.
-Do not generate code. Do not start a new comment line. Do not repeat a comment marker or existing comment text.
-
-<cursor_context>
-${lastLines(before, 8)}<CURSOR>${firstLines(after, 4)}␃
-</cursor_context>
-
-Provide up to ${count} suggestions.`;
-	}
-	const outline = params.outline?.trim() ? params.outline : "(none)";
-	const enclosing = params.enclosingScope?.trim() ? params.enclosingScope : "(none)";
-	return `File: ${filePath}
-Language: ${language}
-
-<file_outline>
-${outline}
-</file_outline>
-
-<enclosing_scope>
-${enclosing}
-</enclosing_scope>
-
-<cursor_context>
-${before}<CURSOR>${after}␃
-</cursor_context>
-
-Provide up to ${count} suggestions.`;
-}
-
-function parseSuggestionBlocks(text: string): string[] {
-	const out: string[] = [];
-	const re = /<SUGGESTION>([\s\S]*?)<\/SUGGESTION>/g;
-	let m: RegExpExecArray | null;
-	while ((m = re.exec(text)) !== null) {
-		out.push(m[1].replace(/^\n+/, "").replace(/\n+$/, ""));
-	}
-	if (out.length === 0) {
-		// Salvage an unclosed trailing <SUGGESTION> when the LLM hit maxTokens
-		// before emitting the closing tag.
-		const open = text.lastIndexOf("<SUGGESTION>");
-		if (open !== -1 && text.indexOf("</SUGGESTION>", open) === -1) {
-			const tail = text.slice(open + "<SUGGESTION>".length).replace(/^\n+/, "").trimEnd();
-			if (tail) out.push(tail);
-		}
-	}
-	return out;
-}
-
 async function logSuggestionDebug(
 	pi: ExtensionAPI,
 	entry: {
 		model: string;
 		params: SuggestionParams;
 		userText: string;
+		durationMs: number;
+		stopReason: string;
+		usage?: unknown;
 		rawText: string;
 		parsedBlocks: string[];
 		returnedSuggestions: string[];
@@ -345,50 +263,6 @@ async function logSuggestionDebug(
 	} catch {
 		// Debug logging must never break suggestions.
 	}
-}
-
-function currentLinePrefix(params: SuggestionParams): string {
-	const before = params.cursorBefore ?? "";
-	return before.slice(before.lastIndexOf("\n") + 1);
-}
-
-function startsWithCommentMarker(text: string): boolean {
-	return /^\s*(?:\/\/[\s\/!]?|#\s?|--\s?|;\s?|\/\*+\s?|\*\s?)/.test(text);
-}
-
-function looksLikeCodeLine(text: string): boolean {
-	const trimmed = text.trimStart();
-	if (/[;{}]/.test(trimmed)) return true;
-	if (/^(?:pub\s+)?(?:const|var|return|try|if|for|while|switch|fn)\b/.test(trimmed)) return true;
-	if (/^@\w+\s*\(/.test(trimmed)) return true;
-	return /^\w+(?:\.\w+)*\s*=/.test(trimmed);
-}
-
-function normalizeCommentSuggestion(block: string, prefix: string): string | null {
-	let firstLine = block.replace(/\r\n/g, "\n").split("\n", 1)[0] ?? "";
-	if (firstLine.startsWith(prefix)) firstLine = firstLine.slice(prefix.length);
-	if (startsWithCommentMarker(firstLine)) return null;
-	if (looksLikeCodeLine(firstLine)) return null;
-	const suggestion = firstLine.trimStart().trimEnd();
-	return suggestion === "" ? null : suggestion;
-}
-
-function alignSuggestion(block: string, params: SuggestionParams): string | null {
-	const prefix = currentLinePrefix(params);
-	let suggestion = block.replace(/\r\n/g, "\n").replace(/^\n+/, "").replace(/\n+$/, "");
-	if (suggestion === "") return null;
-	// The editor inserts the returned text at the cursor. When the cursor is
-	// already after indentation on an otherwise-empty line, a full-line model
-	// response often repeats that indentation; strip only that first-line prefix
-	// so the editor's existing indent is not doubled.
-	if (prefix !== "" && suggestion.startsWith(prefix)) suggestion = suggestion.slice(prefix.length);
-	if (params.cursorInComment) return normalizeCommentSuggestion(suggestion, prefix);
-	if (prefix.trim() !== "") {
-		const firstLine = suggestion.split("\n", 1)[0] ?? "";
-		if (/^\s+\S/.test(firstLine)) return null;
-		return firstLine.trimEnd() || null;
-	}
-	return suggestion;
 }
 
 function resolveSuggestionModel(pi: ExtensionAPI, ctx: ExtensionContext, editorPref: string | undefined) {
@@ -420,6 +294,7 @@ async function generateSuggestions(pi: ExtensionAPI, params: SuggestionParams, s
 	if (!auth.apiKey) throw new Error(`no API key for ${model.provider}`);
 
 	const userText = buildSuggestionPrompt(params);
+	const startedAt = Date.now();
 	const response = await completeSimple(
 		model,
 		{
@@ -448,15 +323,14 @@ async function generateSuggestions(pi: ExtensionAPI, params: SuggestionParams, s
 		.map((c) => c.text)
 		.join("");
 	const blocks = parseSuggestionBlocks(text);
-	const suggestions = blocks
-		.map((block) => alignSuggestion(block, params))
-		.filter((block): block is string => block !== null);
-	const max = params.suggestionCount ?? 3;
-	const returnedSuggestions = suggestions.slice(0, max);
+	const returnedSuggestions = prepareSuggestionCandidates(blocks, params);
 	await logSuggestionDebug(pi, {
 		model: `${model.provider}/${model.id}`,
 		params,
 		userText,
+		durationMs: Date.now() - startedAt,
+		stopReason: response.stopReason,
+		usage: response.usage,
 		rawText: text,
 		parsedBlocks: blocks,
 		returnedSuggestions,

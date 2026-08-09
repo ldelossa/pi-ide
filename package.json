@@ -6,6 +6,7 @@
 	"files": [
 		"client.ts",
 		"index.ts",
+		"suggestion.ts",
 		"LICENSE",
 		"README.md"
 	],
@@ -22,7 +23,8 @@
 		"extensions": ["./index.ts"]
 	},
 	"scripts": {
-		"check": "tsc --noEmit"
+		"check": "tsc --noEmit",
+		"test": "node --test test/*.test.ts"
 	},
 	"dependencies": {
 		"ws": "8.21.0"

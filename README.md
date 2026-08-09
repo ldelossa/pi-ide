@@ -231,13 +231,14 @@ Input:
 | `cursorBefore`    | string | text before cursor (typically ~20 lines)     |
 | `cursorAfter`     | string | text after cursor (typically ~10 lines)      |
 | `suggestionCount` | int    | optional. cap on returned alternatives. Max 3. |
+| `cursorInComment` | bool   | optional. cursor is inside a comment           |
 | `model`           | string | optional. preferred model "provider/id". CLI flag wins if set. |
 
-`outline` is whatever structural sketch the editor produces with its native
-source-analysis tool — treesitter sexpr (Neovim), document symbols from
-LSP (VS Code), PSI tree (JetBrains), or omitted entirely. The model accepts
-any text. Completion quality scales with the amount of structural context
-provided. The minimal viable payload is `cursorBefore` and `cursorAfter`.
+`outline` is an optional compact declaration summary produced with the
+editor's native source-analysis tool — treesitter declarations (Neovim),
+document symbols from LSP (VS Code), PSI symbols (JetBrains), or omitted
+entirely. Local `cursorBefore` and `cursorAfter` context remains the most
+important input; a large raw syntax tree is usually slower and less useful.
 
 Response:
 
@@ -245,7 +246,12 @@ Response:
 { "suggestions": ["<text>", ...] }
 ```
 
-Empty `suggestions` is valid and means the model declined to complete.
+Empty `suggestions` is valid and means the model declined to complete. Each
+returned string is inserted at the cursor exactly as provided after model
+newlines are canonicalized to LF; leading spaces and newlines are meaningful
+and must not be trimmed by the editor. A multi-line candidate is discarded
+when non-whitespace text remains on the cursor line because the reference
+editor cannot preview that suffix relocation exactly.
 
 Cancellation: editor sends `request_cancelled` notification with
 `{ "id": <request id> }`. The extension aborts the in-flight model call.
@@ -261,6 +267,11 @@ For suggestions, prefer low-latency models. Large reasoning models often
 feel too slow for inline completion; smaller coding-capable models such as
 `openai-codex/gpt-5.4-mini` or `deepseek/deepseek-v4-flash` usually provide
 a better interactive experience.
+
+For prompt evaluation, `--pi-ide-suggestion-debug-log <path>` appends the
+request context, rendered prompt, raw model output, parsed/returned candidates,
+latency, stop reason, and usage for each successful request. The log contains
+source code and should be stored and shared accordingly.
 
 ### Request: `listSuggestionModels`
 
@@ -290,6 +301,17 @@ has higher precedence.
 
 Neovim: `pi-ide.nvim`. Implements both the editor-side contract (diffs,
 diagnostics, selection notifications) and the `getSuggestions` client.
-Suggestions always work; treesitter and LSP enrich the context but are
-not required — the feature degrades gracefully to cursor-window-only
-context when either is unavailable.
+Suggestions work without treesitter; when available, treesitter contributes
+a compact semantic declaration outline. Otherwise the feature degrades to
+cursor-window-only context.
+
+## Development
+
+```bash
+npm test
+npm run check
+```
+
+The suggestion tests cover the exact insertion contract, whitespace,
+comment continuations, response parsing, candidate deduplication, and prompt
+shape.
