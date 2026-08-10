@@ -301,9 +301,10 @@ has higher precedence.
 
 Neovim: `pi-ide.nvim`. Implements both the editor-side contract (diffs,
 diagnostics, selection notifications) and the `getSuggestions` client.
-Suggestions work without treesitter; when available, treesitter contributes
-a compact semantic declaration outline. Otherwise the feature degrades to
-cursor-window-only context.
+Suggestions work without treesitter; when available, the Neovim reference
+client uses standardized treesitter `locals` query captures plus a compact
+generic top-level fallback. Language-specific declaration knowledge remains in
+the installed treesitter queries rather than the editor client.
 
 ## Development
 
