@@ -34,6 +34,7 @@ const STICKY_STATE_KEY = Symbol.for("@ldelossa/pi-ide:sticky-state");
 
 type PiIdeSettings = {
 	autoconnect?: boolean;
+	diffRouting?: boolean;
 };
 
 type StickyState = {
@@ -48,6 +49,7 @@ function extractPiIdeSettings(settings: Record<string, unknown>): PiIdeSettings 
 	const obj = raw as Record<string, unknown>;
 	return {
 		autoconnect: typeof obj.autoconnect === "boolean" ? obj.autoconnect : undefined,
+		diffRouting: typeof obj.diffRouting === "boolean" ? obj.diffRouting : undefined,
 	};
 }
 
@@ -56,6 +58,13 @@ function isAutoconnectEnabled(cwd: string): boolean {
 	const globalSettings = extractPiIdeSettings(manager.getGlobalSettings() as Record<string, unknown>);
 	const projectSettings = extractPiIdeSettings(manager.getProjectSettings() as Record<string, unknown>);
 	return projectSettings.autoconnect ?? globalSettings.autoconnect ?? true;
+}
+
+function isDiffRoutingEnabled(cwd: string): boolean {
+	const manager = SettingsManager.create(cwd);
+	const globalSettings = extractPiIdeSettings(manager.getGlobalSettings() as Record<string, unknown>);
+	const projectSettings = extractPiIdeSettings(manager.getProjectSettings() as Record<string, unknown>);
+	return projectSettings.diffRouting ?? globalSettings.diffRouting ?? true;
 }
 
 // --- Sticky state helpers ---
@@ -557,6 +566,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (!client?.isConnected()) return;
+		if (!isDiffRoutingEnabled(ctx.cwd)) return; // direct writes; review in git instead of IDE diffs
 
 		let path: string;
 		let originalContent: string;
