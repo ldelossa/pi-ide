@@ -534,12 +534,31 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Editor state (file/cursor/selection) attaches only to real user
+	// prompts. Pi serializes custom context messages as user messages, so
+	// injecting the static <editor> block on tool-call continuations read as
+	// "the user just opened <file>, no new message" and the model narrated
+	// it at the start of every thought.
+	// Diagnostics get two paths: a fresh snapshot alongside user prompts
+	// (mirrors what the user sees in the editor), and mid-run injection only
+	// when they actually change — LSP lags behind edits, so re-injecting
+	// identical diagnostics right after a write reads as stale.
+	let lastDiagnostics: string | null = null;
 	pi.on("context", async (event) => {
+		const last = event.messages[event.messages.length - 1];
+		const isUserPrompt = last?.role === "user";
 		const blocks: string[] = [];
-		const editor = renderEditorBlock();
-		if (editor) blocks.push(editor);
+		if (isUserPrompt) {
+			const editor = renderEditorBlock();
+			if (editor) blocks.push(editor);
+		}
 		const diagnostics = await fetchDiagnosticsBlock();
-		if (diagnostics) blocks.push(diagnostics);
+		if (diagnostics && (isUserPrompt || diagnostics !== lastDiagnostics)) {
+			blocks.push(diagnostics);
+			lastDiagnostics = diagnostics;
+		} else if (!diagnostics) {
+			lastDiagnostics = null;
+		}
 		if (blocks.length === 0) return;
 		return {
 			messages: [
